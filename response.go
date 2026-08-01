@@ -5,9 +5,11 @@ import (
 	"net/http"
 )
 
-type Response struct {
-	res *http.Response
-}
+type (
+	Response struct {
+		res *http.Response
+	}
+)
 
 func (r *Response) StatusCode() int {
 	return r.res.StatusCode
@@ -30,8 +32,8 @@ func (r *Response) ContentLength() int64 {
 	return r.res.ContentLength
 }
 
-func (r *Response) GetHeader(key string) string {
-	return r.res.Header.Get(key)
+func (r *Response) GetHeader() *Header {
+	return &Header{hdr: r.res.Header}
 }
 
 func (r *Response) Proto() string {
