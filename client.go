@@ -19,10 +19,6 @@ type (
 		Header    http.Header
 		Context   context.Context
 	}
-	//
-	Header struct {
-		h http.Header
-	}
 )
 
 func New(uri *url.URL) *Client {
