@@ -3,11 +3,15 @@ package annette
 import (
 	"io"
 	"net/http"
+	"sync"
 )
 
 type (
 	Response struct {
-		res *http.Response
+		res     *http.Response
+		once    sync.Once
+		content []byte
+		err     error
 	}
 )
 
@@ -20,12 +24,31 @@ func (r *Response) Body() string {
 }
 
 func (r *Response) Binary() []byte {
-	defer r.res.Body.Close()
-	content, err := io.ReadAll(r.res.Body)
+	content, err := r.read()
 	if err != nil {
 		return []byte{}
 	}
 	return content
+}
+
+// Err returns the error that occurred while reading the response body, if any.
+func (r *Response) Err() error {
+	_, err := r.read()
+	return err
+}
+
+// read reads and closes the response body only once, so that Body and Binary
+// can be called repeatedly and always return the same content.
+func (r *Response) read() ([]byte, error) {
+	r.once.Do(func() {
+		if r.res.Body == nil {
+			r.content = []byte{}
+			return
+		}
+		defer r.res.Body.Close()
+		r.content, r.err = io.ReadAll(r.res.Body)
+	})
+	return r.content, r.err
 }
 
 func (r *Response) ContentLength() int64 {
@@ -57,7 +80,7 @@ func (r *Response) Uncompressed() bool {
 }
 
 func (r *Response) IsStatus100s() bool {
-	return r.res.StatusCode < 200
+	return r.res.StatusCode >= 100 && r.res.StatusCode < 200
 }
 
 func (r *Response) IsStatus200s() bool {
@@ -73,7 +96,7 @@ func (r *Response) IsStatus400s() bool {
 }
 
 func (r *Response) IsStatus500s() bool {
-	return r.res.StatusCode >= 500
+	return r.res.StatusCode >= 500 && r.res.StatusCode < 600
 }
 
 func (r *Response) IsStatus100() bool {
