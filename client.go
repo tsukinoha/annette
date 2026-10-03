@@ -2,6 +2,7 @@ package annette
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -30,12 +31,27 @@ func New(uri *url.URL) *Client {
 	}
 }
 
-func (c *Client) send(method string, body io.Reader) (*Response, error) {
-	req, err := http.NewRequestWithContext(c.Context, method, c.uri.String(), body)
+func (c *Client) newRequest(method string, body io.Reader) (*http.Request, error) {
+	if c.uri == nil {
+		return nil, errors.New("annette: uri is nil")
+	}
+	ctx := c.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.uri.String(), body)
 	if err != nil {
 		return nil, err
 	}
-	req.Header = c.Header
+	// Clone so that per-request changes never leak into the client's header.
+	req.Header = c.Header.Clone()
+	if req.Header == nil {
+		req.Header = http.Header{}
+	}
+	return req, nil
+}
+
+func (c *Client) do(req *http.Request) (*Response, error) {
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -43,40 +59,45 @@ func (c *Client) send(method string, body io.Reader) (*Response, error) {
 	return &Response{res: res}, nil
 }
 
-func (c *Client) upload(method string, stream io.ReadCloser) (*Response, error) {
-	r, w := io.Pipe()
-	req, err := http.NewRequestWithContext(c.Context, method, c.uri.String(), r)
+func (c *Client) send(method string, body io.Reader) (*Response, error) {
+	req, err := c.newRequest(method, body)
 	if err != nil {
 		return nil, err
 	}
+	return c.do(req)
+}
 
+func (c *Client) upload(method string, stream io.ReadCloser) (*Response, error) {
+	if stream == nil {
+		return nil, errors.New("annette: stream is nil")
+	}
+	r, w := io.Pipe()
+	req, err := c.newRequest(method, r)
+	if err != nil {
+		stream.Close()
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	size := c.ChunkSize
+	if size < 1 {
+		size = chunkSize
+	}
 	go func() {
-		defer w.Close()
 		defer stream.Close()
-
-		if c.ChunkSize < 1 {
-			c.ChunkSize = chunkSize
-		}
-		b := make([]byte, c.ChunkSize)
-		for {
-			_, err := stream.Read(b)
-			if err == io.EOF {
-				return
-			}
-			if err != nil {
-				return
-			}
-			w.Write(b)
-		}
+		b := make([]byte, size)
+		_, err := io.CopyBuffer(w, struct{ io.Reader }{stream}, b)
+		// CloseWithError(nil) behaves like Close (reader receives io.EOF).
+		w.CloseWithError(err)
 	}()
 
-	c.Header.Set("Content-type", "application/octet-stream")
-	req.Header = c.Header
-	res, err := http.DefaultClient.Do(req)
+	res, err := c.do(req)
 	if err != nil {
+		// Unblock the writer goroutine if the transport did not consume the body.
+		r.CloseWithError(err)
 		return nil, err
 	}
-	return &Response{res: res}, nil
+	return res, nil
 }
 
 func (c *Client) Get() (*Response, error) {
