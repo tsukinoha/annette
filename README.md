@@ -2,8 +2,8 @@
 
 Annette is a simple HTTP client for Go.
 
-It wraps `net/http` with a small API: build a `Client` for one URL, call a
-method such as `Get()` or `Post()`, and read the result through helper methods
+It wraps `net/http` with a small API: build a `Client`, call a method such as
+`Get(ctx, uri)` or `Post(ctx, uri, body)`, and read the result through helper methods
 like `Body()` and `IsStatus200()`. It can also stream large uploads in chunks
 without loading the whole payload into memory.
 
@@ -13,7 +13,7 @@ without loading the whole payload into memory.
   `Options` and `Trace`
 - Streaming uploads (`UploadByPost` / `UploadByPut` / `UploadByPatch`) with a
   configurable chunk size
-- Default headers and a `context.Context` for each client
+- Default headers for each client and a `context.Context` for each request
 - Response helpers for the body, headers, protocol and status code checks
   (by class, such as `IsStatus400s()`, or by exact code, such as `IsStatus404()`)
 - No dependencies outside the Go standard library
@@ -34,28 +34,52 @@ go get github.com/tsukinoha/annette
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/url"
+	"time"
 
 	"github.com/tsukinoha/annette"
 )
 
 func main() {
+	// The parent context for the whole program. Calling cancel stops every
+	// request that was started from it.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	uri, err := url.Parse("https://example.com")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	client := annette.New(uri)
-	res, err := client.Get()
-	if err != nil {
+	client := annette.New()
+	if err := fetch(ctx, client, uri); err != nil {
 		log.Fatal(err)
+	}
+}
+
+func fetch(ctx context.Context, client *annette.Client, uri *url.URL) error {
+	// A timeout for this request only, derived from the parent context.
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	res, err := client.Get(ctx, uri)
+	if err != nil {
+		return err
+	}
+
+	// Read the body before cancel runs (see "Timeouts and cancellation").
+	body := res.Body()
+	if err := res.Err(); err != nil {
+		return err
 	}
 
 	fmt.Println(res.StatusCode())
 	fmt.Println(res.GetHeader().Get("Content-Type"))
-	fmt.Println(res.Body())
+	fmt.Println(body)
+	return nil
 }
 ```
 
@@ -63,17 +87,17 @@ func main() {
 
 ### Creating a client
 
-`New` creates a client for one URL. The client has these public fields:
+`New` creates a client. The URL and the context are not stored in the client;
+you pass them to each request, so one client can be shared by many requests
+(and goroutines) to different URLs. The client has these public fields:
 
 | Field       | Type              | Default                | Description                              |
 |-------------|-------------------|------------------------|------------------------------------------|
 | `Header`    | `http.Header`     | empty                  | Headers sent with every request          |
-| `Context`   | `context.Context` | `context.Background()` | Context used for every request           |
-| `ChunkSize` | `int`             | `1048576` (1 MB)       | Buffer size for streaming uploads        |
+| `ChunkSize` | `int`             | `4194304` (4 MB)       | Buffer size for streaming uploads        |
 
 ```go
-uri, _ := url.Parse("https://api.example.com/items")
-client := annette.New(uri)
+client := annette.New()
 
 client.Header.Set("Authorization", "Bearer <token>")
 client.Header.Set("Accept", "application/json")
@@ -84,17 +108,26 @@ client's headers.
 
 ### Sending requests
 
+In the examples below, `ctx` is a per-request context created with
+`context.WithTimeout` from the parent context (see
+[Timeouts and cancellation](#timeouts-and-cancellation)).
+
 ```go
-res, err := client.Get()
-res, err := client.Head()
-res, err := client.Delete()
-res, err := client.Options()
-res, err := client.Trace()
+ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+defer cancel()
+
+uri, _ := url.Parse("https://api.example.com/items")
+
+res, err := client.Get(ctx, uri)
+res, err := client.Head(ctx, uri)
+res, err := client.Delete(ctx, uri)
+res, err := client.Options(ctx, uri)
+res, err := client.Trace(ctx, uri)
 
 // Methods with a body take an io.Reader.
-res, err := client.Post(strings.NewReader(`{"name":"annette"}`))
-res, err := client.Put(bytes.NewReader(data))
-res, err := client.Patch(strings.NewReader(`{"name":"new"}`))
+res, err := client.Post(ctx, uri, strings.NewReader(`{"name":"annette"}`))
+res, err := client.Put(ctx, uri, bytes.NewReader(data))
+res, err := client.Patch(ctx, uri, strings.NewReader(`{"name":"new"}`))
 ```
 
 The `Content-Type` header is not set for you. Set it in `client.Header` when
@@ -102,20 +135,62 @@ the server needs it:
 
 ```go
 client.Header.Set("Content-Type", "application/json")
-res, err := client.Post(strings.NewReader(`{"name":"annette"}`))
+res, err := client.Post(ctx, uri, strings.NewReader(`{"name":"annette"}`))
 ```
 
 ### Timeouts and cancellation
 
-Set `client.Context` to control how long a request may take:
+Every request method takes a `context.Context`. The context must not be
+`nil`. A good pattern uses two levels:
+
+1. In `main` (or wherever your program's work starts), create one parent
+   context with `context.WithCancel`. Calling its `cancel` stops all requests
+   that are still running, for example on shutdown.
+2. For each request, create a child context with `context.WithTimeout` from the
+   parent. It limits how long that one request may take, and it is still
+   canceled when the parent is canceled.
 
 ```go
-ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-defer cancel()
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-client.Context = ctx
-res, err := client.Get() // err wraps context.DeadlineExceeded after 10 seconds
+	client := annette.New()
+	for _, raw := range []string{"https://example.com/a", "https://example.com/b"} {
+		uri, err := url.Parse(raw)
+		if err != nil {
+			log.Fatal(err)
+		}
+		body, err := get(ctx, client, uri)
+		if err != nil {
+			log.Println(err) // wraps context.DeadlineExceeded after 10 seconds
+			continue
+		}
+		fmt.Println(body)
+	}
+}
+
+func get(ctx context.Context, client *annette.Client, uri *url.URL) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	res, err := client.Get(ctx, uri)
+	if err != nil {
+		return "", err
+	}
+	body := res.Body()
+	return body, res.Err()
+}
 ```
+
+Create the per-request context in its own function, as `get` does above, so
+that `defer cancel()` runs when each request ends. A `defer` inside the `for`
+loop in `main` would not run until `main` returns.
+
+The context also covers reading the response body. If the context is
+canceled before you call `Body()`, `Binary()` or `Err()`, the read fails and
+`Err()` returns the context's error. Read the body before `cancel` runs, as
+`get` does above.
 
 ### Uploading large files
 
@@ -123,24 +198,38 @@ The upload methods stream data from an `io.ReadCloser` to the server in chunks
 of `ChunkSize` bytes, so the whole file is never held in memory. The request is
 sent with `Content-Type: application/octet-stream`.
 
-```go
-f, err := os.Open("large-file.iso")
-if err != nil {
-	log.Fatal(err)
-}
+Large uploads can take a long time, so give them a longer timeout than other
+requests:
 
-client.ChunkSize = 4 * 1024 * 1024 // 4 MB (optional)
-res, err := client.UploadByPut(f)  // or UploadByPost / UploadByPatch
-if err != nil {
-	log.Fatal(err)
+```go
+func upload(ctx context.Context, client *annette.Client, uri *url.URL, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+
+	client.ChunkSize = 1024 * 1024               // 1 MB (optional)
+	res, err := client.UploadByPut(ctx, uri, f) // or UploadByPost / UploadByPatch
+	if err != nil {
+		return err
+	}
+	if err := res.Err(); err != nil {
+		return err
+	}
+	fmt.Println(res.StatusCode())
+	return nil
 }
-fmt.Println(res.StatusCode())
 ```
 
 - The client closes the stream for you, including when the request fails.
 - If reading the stream fails partway, the request fails as well, so a
   partial upload is not reported as a success.
-- If `ChunkSize` is less than 1, the default of 1 MB is used.
+- If `ChunkSize` is less than 1, the default of 4 MB is used.
+- If the context is canceled during an upload, the request returns the
+  context's error right away.
 
 ### Reading the response
 
@@ -216,7 +305,7 @@ There is an `IsStatusXXX()` method for each status code defined in
 
 Request methods return an error when:
 
-- the client was created with a `nil` URL
+- the context or the URL is `nil`
 - an upload method is called with a `nil` stream
 - the request cannot be sent (DNS failure, connection refused, TLS error, and
   so on)
