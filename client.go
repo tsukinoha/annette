@@ -9,37 +9,36 @@ import (
 )
 
 const (
-	chunkSize int = 1048576 // 1MB
+	chunkSize int = 4194304 // 4MB
 )
 
 type (
-	// Client is a HTTP client structure in Annette package
+	// Client is a HTTP client structure in Annette package.
+	// It holds no per-request state, so one Client can be reused for many
+	// requests. Each request method takes the context and URL to use.
+	// The context also covers reading the response body, so do not cancel it
+	// until the body has been read with Response.Body, Binary or Err.
 	Client struct {
-		uri       *url.URL
 		ChunkSize int
 		Header    http.Header
-		Context   context.Context
 	}
 )
 
-func New(uri *url.URL) *Client {
+func New() *Client {
 	return &Client{
-		uri:       uri,
 		ChunkSize: chunkSize,
 		Header:    http.Header{},
-		Context:   context.Background(),
 	}
 }
 
-func (c *Client) newRequest(method string, body io.Reader) (*http.Request, error) {
-	if c.uri == nil {
+func (c *Client) newRequest(ctx context.Context, method string, uri *url.URL, body io.Reader) (*http.Request, error) {
+	if ctx == nil {
+		return nil, errors.New("annette: ctx is nil")
+	}
+	if uri == nil {
 		return nil, errors.New("annette: uri is nil")
 	}
-	ctx := c.Context
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.uri.String(), body)
+	req, err := http.NewRequestWithContext(ctx, method, uri.String(), body)
 	if err != nil {
 		return nil, err
 	}
@@ -59,20 +58,20 @@ func (c *Client) do(req *http.Request) (*Response, error) {
 	return &Response{res: res}, nil
 }
 
-func (c *Client) send(method string, body io.Reader) (*Response, error) {
-	req, err := c.newRequest(method, body)
+func (c *Client) send(ctx context.Context, method string, uri *url.URL, body io.Reader) (*Response, error) {
+	req, err := c.newRequest(ctx, method, uri, body)
 	if err != nil {
 		return nil, err
 	}
 	return c.do(req)
 }
 
-func (c *Client) upload(method string, stream io.ReadCloser) (*Response, error) {
+func (c *Client) upload(ctx context.Context, method string, uri *url.URL, stream io.ReadCloser) (*Response, error) {
 	if stream == nil {
 		return nil, errors.New("annette: stream is nil")
 	}
 	r, w := io.Pipe()
-	req, err := c.newRequest(method, r)
+	req, err := c.newRequest(ctx, method, uri, r)
 	if err != nil {
 		stream.Close()
 		return nil, err
@@ -83,7 +82,13 @@ func (c *Client) upload(method string, stream io.ReadCloser) (*Response, error) 
 	if size < 1 {
 		size = chunkSize
 	}
+	// The transport waits for the body to be written before it returns, even
+	// after ctx is done, so break the pipe on cancel to unblock it.
+	stop := context.AfterFunc(ctx, func() {
+		r.CloseWithError(context.Cause(ctx))
+	})
 	go func() {
+		defer stop()
 		defer stream.Close()
 		b := make([]byte, size)
 		_, err := io.CopyBuffer(w, struct{ io.Reader }{stream}, b)
@@ -100,46 +105,46 @@ func (c *Client) upload(method string, stream io.ReadCloser) (*Response, error) 
 	return res, nil
 }
 
-func (c *Client) Get() (*Response, error) {
-	return c.send(http.MethodGet, nil)
+func (c *Client) Get(ctx context.Context, uri *url.URL) (*Response, error) {
+	return c.send(ctx, http.MethodGet, uri, nil)
 }
 
-func (c *Client) Head() (*Response, error) {
-	return c.send(http.MethodHead, nil)
+func (c *Client) Head(ctx context.Context, uri *url.URL) (*Response, error) {
+	return c.send(ctx, http.MethodHead, uri, nil)
 }
 
-func (c *Client) Post(body io.Reader) (*Response, error) {
-	return c.send(http.MethodPost, body)
+func (c *Client) Post(ctx context.Context, uri *url.URL, body io.Reader) (*Response, error) {
+	return c.send(ctx, http.MethodPost, uri, body)
 }
 
-func (c *Client) Put(body io.Reader) (*Response, error) {
-	return c.send(http.MethodPut, body)
+func (c *Client) Put(ctx context.Context, uri *url.URL, body io.Reader) (*Response, error) {
+	return c.send(ctx, http.MethodPut, uri, body)
 }
 
-func (c *Client) Patch(body io.Reader) (*Response, error) {
-	return c.send(http.MethodPatch, body)
+func (c *Client) Patch(ctx context.Context, uri *url.URL, body io.Reader) (*Response, error) {
+	return c.send(ctx, http.MethodPatch, uri, body)
 }
 
-func (c *Client) Delete() (*Response, error) {
-	return c.send(http.MethodDelete, nil)
+func (c *Client) Delete(ctx context.Context, uri *url.URL) (*Response, error) {
+	return c.send(ctx, http.MethodDelete, uri, nil)
 }
 
-func (c *Client) Options() (*Response, error) {
-	return c.send(http.MethodOptions, nil)
+func (c *Client) Options(ctx context.Context, uri *url.URL) (*Response, error) {
+	return c.send(ctx, http.MethodOptions, uri, nil)
 }
 
-func (c *Client) Trace() (*Response, error) {
-	return c.send(http.MethodTrace, nil)
+func (c *Client) Trace(ctx context.Context, uri *url.URL) (*Response, error) {
+	return c.send(ctx, http.MethodTrace, uri, nil)
 }
 
-func (c *Client) UploadByPost(stream io.ReadCloser) (*Response, error) {
-	return c.upload(http.MethodPost, stream)
+func (c *Client) UploadByPost(ctx context.Context, uri *url.URL, stream io.ReadCloser) (*Response, error) {
+	return c.upload(ctx, http.MethodPost, uri, stream)
 }
 
-func (c *Client) UploadByPut(stream io.ReadCloser) (*Response, error) {
-	return c.upload(http.MethodPut, stream)
+func (c *Client) UploadByPut(ctx context.Context, uri *url.URL, stream io.ReadCloser) (*Response, error) {
+	return c.upload(ctx, http.MethodPut, uri, stream)
 }
 
-func (c *Client) UploadByPatch(stream io.ReadCloser) (*Response, error) {
-	return c.upload(http.MethodPatch, stream)
+func (c *Client) UploadByPatch(ctx context.Context, uri *url.URL, stream io.ReadCloser) (*Response, error) {
+	return c.upload(ctx, http.MethodPatch, uri, stream)
 }
