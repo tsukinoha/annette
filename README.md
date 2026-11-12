@@ -3,7 +3,7 @@
 Annette is a simple HTTP client for Go.
 
 It wraps `net/http` with a small API: build a `Client`, call a method such as
-`Get(ctx, uri)` or `Post(ctx, uri, body)`, and read the result through helper methods
+`Get(uri)` or `Post(uri, body)`, and read the result through helper methods
 like `Body()` and `IsStatus200()`. It can also stream large uploads in chunks
 without loading the whole payload into memory.
 
@@ -13,7 +13,7 @@ without loading the whole payload into memory.
   `Options` and `Trace`
 - Streaming uploads (`UploadByPost` / `UploadByPut` / `UploadByPatch`) with a
   configurable chunk size
-- Default headers for each client and a `context.Context` for each request
+- Default headers and a timeout for each client (30 seconds by default)
 - Response helpers for the body, headers, protocol and status code checks
   (by class, such as `IsStatus400s()`, or by exact code, such as `IsStatus404()`)
 - No dependencies outside the Go standard library
@@ -34,52 +34,35 @@ go get github.com/tsukinoha/annette
 package main
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"net/url"
-	"time"
 
 	"github.com/tsukinoha/annette"
 )
 
 func main() {
-	// The parent context for the whole program. Calling cancel stops every
-	// request that was started from it.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	uri, err := url.Parse("https://example.com")
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	client := annette.New()
-	if err := fetch(ctx, client, uri); err != nil {
+	client.SetTimeout(10) // seconds; optional, the default is 30 seconds
+
+	res, err := client.Get(uri)
+	if err != nil {
 		log.Fatal(err)
 	}
-}
 
-func fetch(ctx context.Context, client *annette.Client, uri *url.URL) error {
-	// A timeout for this request only, derived from the parent context.
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	res, err := client.Get(ctx, uri)
-	if err != nil {
-		return err
-	}
-
-	// Read the body before cancel runs (see "Timeouts and cancellation").
 	body := res.Body()
 	if err := res.Err(); err != nil {
-		return err
+		log.Fatal(err)
 	}
 
 	fmt.Println(res.StatusCode())
 	fmt.Println(res.GetHeader().Get("Content-Type"))
 	fmt.Println(body)
-	return nil
 }
 ```
 
@@ -87,9 +70,9 @@ func fetch(ctx context.Context, client *annette.Client, uri *url.URL) error {
 
 ### Creating a client
 
-`New` creates a client. The URL and the context are not stored in the client;
-you pass them to each request, so one client can be shared by many requests
-(and goroutines) to different URLs. The client has these public fields:
+`New` creates a client. The URL is not stored in the client; you pass it to
+each request, so one client can be shared by many requests (and goroutines) to
+different URLs. The client has these public fields:
 
 | Field       | Type              | Default                | Description                              |
 |-------------|-------------------|------------------------|------------------------------------------|
@@ -108,26 +91,19 @@ client's headers.
 
 ### Sending requests
 
-In the examples below, `ctx` is a per-request context created with
-`context.WithTimeout` from the parent context (see
-[Timeouts and cancellation](#timeouts-and-cancellation)).
-
 ```go
-ctx, cancel := context.WithTimeout(parent, 10*time.Second)
-defer cancel()
-
 uri, _ := url.Parse("https://api.example.com/items")
 
-res, err := client.Get(ctx, uri)
-res, err := client.Head(ctx, uri)
-res, err := client.Delete(ctx, uri)
-res, err := client.Options(ctx, uri)
-res, err := client.Trace(ctx, uri)
+res, err := client.Get(uri)
+res, err := client.Head(uri)
+res, err := client.Delete(uri)
+res, err := client.Options(uri)
+res, err := client.Trace(uri)
 
 // Methods with a body take an io.Reader.
-res, err := client.Post(ctx, uri, strings.NewReader(`{"name":"annette"}`))
-res, err := client.Put(ctx, uri, bytes.NewReader(data))
-res, err := client.Patch(ctx, uri, strings.NewReader(`{"name":"new"}`))
+res, err := client.Post(uri, strings.NewReader(`{"name":"annette"}`))
+res, err := client.Put(uri, bytes.NewReader(data))
+res, err := client.Patch(uri, strings.NewReader(`{"name":"new"}`))
 ```
 
 The `Content-Type` header is not set for you. Set it in `client.Header` when
@@ -135,62 +111,44 @@ the server needs it:
 
 ```go
 client.Header.Set("Content-Type", "application/json")
-res, err := client.Post(ctx, uri, strings.NewReader(`{"name":"annette"}`))
+res, err := client.Post(uri, strings.NewReader(`{"name":"annette"}`))
 ```
 
-### Timeouts and cancellation
+### Timeouts
 
-Every request method takes a `context.Context`. The context must not be
-`nil`. A good pattern uses two levels:
-
-1. In `main` (or wherever your program's work starts), create one parent
-   context with `context.WithCancel`. Calling its `cancel` stops all requests
-   that are still running, for example on shutdown.
-2. For each request, create a child context with `context.WithTimeout` from the
-   parent. It limits how long that one request may take, and it is still
-   canceled when the parent is canceled.
+Every request is limited by the client's timeout, which is 30 seconds by
+default. Change it with `SetTimeout`, which takes the number of seconds:
 
 ```go
-func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+client := annette.New()
+client.SetTimeout(10)
+fmt.Println(client.Timeout()) // 10s (Timeout returns a time.Duration)
 
-	client := annette.New()
-	for _, raw := range []string{"https://example.com/a", "https://example.com/b"} {
-		uri, err := url.Parse(raw)
-		if err != nil {
-			log.Fatal(err)
-		}
-		body, err := get(ctx, client, uri)
-		if err != nil {
-			log.Println(err) // wraps context.DeadlineExceeded after 10 seconds
-			continue
-		}
-		fmt.Println(body)
-	}
-}
-
-func get(ctx context.Context, client *annette.Client, uri *url.URL) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	res, err := client.Get(ctx, uri)
-	if err != nil {
-		return "", err
-	}
-	body := res.Body()
-	return body, res.Err()
-}
+client.SetTimeout(0)  // no timeout
+client.SetTimeout(-1) // back to the default of 30 seconds
 ```
 
-Create the per-request context in its own function, as `get` does above, so
-that `defer cancel()` runs when each request ends. A `defer` inside the `for`
-loop in `main` would not run until `main` returns.
+- The timeout covers the whole request: connecting, sending the request body,
+  waiting for the response and reading the response body with `Body()`,
+  `Binary()` or `Err()`.
+- When the timeout expires, the request method (or `Err()`, if it expires while
+  the body is being read) returns an error that wraps
+  `context.DeadlineExceeded`:
 
-The context also covers reading the response body. If the context is
-canceled before you call `Body()`, `Binary()` or `Err()`, the read fails and
-`Err()` returns the context's error. Read the body before `cancel` runs, as
-`get` does above.
+  ```go
+  res, err := client.Get(uri)
+  if errors.Is(err, context.DeadlineExceeded) {
+  	log.Println("timed out")
+  }
+  ```
+
+- `0` means no timeout, and a negative value restores the default of 30
+  seconds.
+- The timeout is set in whole seconds, so it cannot be shorter than one second
+  (except `0`).
+- Call `SetTimeout` before you start sending requests. It must not be called
+  while requests made with the same client are in progress. To use different
+  timeouts, create a client for each one.
 
 ### Uploading large files
 
@@ -198,38 +156,35 @@ The upload methods stream data from an `io.ReadCloser` to the server in chunks
 of `ChunkSize` bytes, so the whole file is never held in memory. The request is
 sent with `Content-Type: application/octet-stream`.
 
-Large uploads can take a long time, so give them a longer timeout than other
-requests:
+The client's timeout also applies to uploads, and large uploads can take a long
+time. Use a separate client for uploads with a longer timeout:
 
 ```go
-func upload(ctx context.Context, client *annette.Client, uri *url.URL, path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
+uploader := annette.New()
+uploader.SetTimeout(30 * 60) // 30 minutes
+uploader.ChunkSize = 1024 * 1024 // 1 MB (optional)
 
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
-	defer cancel()
-
-	client.ChunkSize = 1024 * 1024               // 1 MB (optional)
-	res, err := client.UploadByPut(ctx, uri, f) // or UploadByPost / UploadByPatch
-	if err != nil {
-		return err
-	}
-	if err := res.Err(); err != nil {
-		return err
-	}
-	fmt.Println(res.StatusCode())
-	return nil
+f, err := os.Open(path)
+if err != nil {
+	return err
 }
+res, err := uploader.UploadByPut(uri, f) // or UploadByPost / UploadByPatch
+if err != nil {
+	return err
+}
+if err := res.Err(); err != nil {
+	return err
+}
+fmt.Println(res.StatusCode())
 ```
 
 - The client closes the stream for you, including when the request fails.
 - If reading the stream fails partway, the request fails as well, so a
   partial upload is not reported as a success.
 - If `ChunkSize` is less than 1, the default of 4 MB is used.
-- If the context is canceled during an upload, the request returns the
-  context's error right away.
+- If the timeout expires during an upload, the request returns the error
+  right away, even when the stream is blocked. With `SetTimeout(0)` a blocked
+  stream is never stopped, so set a timeout for uploads.
 
 ### Reading the response
 
@@ -305,11 +260,11 @@ There is an `IsStatusXXX()` method for each status code defined in
 
 Request methods return an error when:
 
-- the context or the URL is `nil`
+- the URL is `nil`
 - an upload method is called with a `nil` stream
 - the request cannot be sent (DNS failure, connection refused, TLS error, and
   so on)
-- the context is canceled or its deadline passes
+- the client's timeout expires (the error wraps `context.DeadlineExceeded`)
 - an upload stream returns an error while it is being read
 
 HTTP error statuses such as 404 or 500 are **not** returned as errors. Check

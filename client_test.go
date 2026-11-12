@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -38,7 +39,7 @@ func newTestServer(t *testing.T) (*httptest.Server, chan recorded) {
 }
 
 // newBlockingServer returns a server whose handler blocks until the client
-// gives up on the request, so that only the client's context can end it.
+// gives up on the request, so that only the client's timeout can end it.
 func newBlockingServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -109,12 +110,14 @@ func TestNew(t *testing.T) {
 	if c.Header == nil {
 		t.Error("Header is nil")
 	}
+	if got := c.Timeout(); got != defaultTimeout {
+		t.Errorf("Timeout() = %v, want %v", got, defaultTimeout)
+	}
 }
 
 func TestClientMethods(t *testing.T) {
 	srv, ch := newTestServer(t)
 	c := New()
-	ctx := context.Background()
 	uri := parseURL(t, srv.URL)
 
 	tests := []struct {
@@ -123,14 +126,14 @@ func TestClientMethods(t *testing.T) {
 		call   func() (*Response, error)
 		body   string
 	}{
-		{"Get", http.MethodGet, func() (*Response, error) { return c.Get(ctx, uri) }, ""},
-		{"Head", http.MethodHead, func() (*Response, error) { return c.Head(ctx, uri) }, ""},
-		{"Post", http.MethodPost, func() (*Response, error) { return c.Post(ctx, uri, strings.NewReader("post-body")) }, "post-body"},
-		{"Put", http.MethodPut, func() (*Response, error) { return c.Put(ctx, uri, strings.NewReader("put-body")) }, "put-body"},
-		{"Patch", http.MethodPatch, func() (*Response, error) { return c.Patch(ctx, uri, strings.NewReader("patch-body")) }, "patch-body"},
-		{"Delete", http.MethodDelete, func() (*Response, error) { return c.Delete(ctx, uri) }, ""},
-		{"Options", http.MethodOptions, func() (*Response, error) { return c.Options(ctx, uri) }, ""},
-		{"Trace", http.MethodTrace, func() (*Response, error) { return c.Trace(ctx, uri) }, ""},
+		{"Get", http.MethodGet, func() (*Response, error) { return c.Get(uri) }, ""},
+		{"Head", http.MethodHead, func() (*Response, error) { return c.Head(uri) }, ""},
+		{"Post", http.MethodPost, func() (*Response, error) { return c.Post(uri, strings.NewReader("post-body")) }, "post-body"},
+		{"Put", http.MethodPut, func() (*Response, error) { return c.Put(uri, strings.NewReader("put-body")) }, "put-body"},
+		{"Patch", http.MethodPatch, func() (*Response, error) { return c.Patch(uri, strings.NewReader("patch-body")) }, "patch-body"},
+		{"Delete", http.MethodDelete, func() (*Response, error) { return c.Delete(uri) }, ""},
+		{"Options", http.MethodOptions, func() (*Response, error) { return c.Options(uri) }, ""},
+		{"Trace", http.MethodTrace, func() (*Response, error) { return c.Trace(uri) }, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -167,7 +170,7 @@ func TestClientUsesRequestURI(t *testing.T) {
 	c := New()
 
 	for _, path := range []string{"/a", "/b"} {
-		res, err := c.Get(context.Background(), parseURL(t, srv.URL+path))
+		res, err := c.Get(parseURL(t, srv.URL+path))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -183,7 +186,7 @@ func TestClientSendsHeader(t *testing.T) {
 	c := New()
 	c.Header.Set("Authorization", "Bearer token")
 
-	if _, err := c.Get(context.Background(), parseURL(t, srv.URL)); err != nil {
+	if _, err := c.Get(parseURL(t, srv.URL)); err != nil {
 		t.Fatal(err)
 	}
 	got := <-ch
@@ -196,150 +199,30 @@ func TestClientNilHeader(t *testing.T) {
 	srv, ch := newTestServer(t)
 	c := New()
 	c.Header = nil
-	ctx := context.Background()
 	uri := parseURL(t, srv.URL)
 
-	if _, err := c.Get(ctx, uri); err != nil {
+	if _, err := c.Get(uri); err != nil {
 		t.Fatalf("Get: %v", err)
 	}
 	<-ch
-	if _, err := c.UploadByPost(ctx, uri, io.NopCloser(strings.NewReader("x"))); err != nil {
+	if _, err := c.UploadByPost(uri, io.NopCloser(strings.NewReader("x"))); err != nil {
 		t.Fatalf("UploadByPost: %v", err)
 	}
 	<-ch
 }
 
-func TestClientNilContext(t *testing.T) {
-	c := New()
-	uri := parseURL(t, "http://example.com")
-
-	if _, err := c.Get(nil, uri); err == nil { //nolint:staticcheck // intentionally testing nil context
-		t.Error("Get with nil ctx: want error")
-	}
-	stream := newReadCloser(strings.NewReader("x"))
-	if _, err := c.UploadByPost(nil, uri, stream); err == nil { //nolint:staticcheck // intentionally testing nil context
-		t.Error("UploadByPost with nil ctx: want error")
-	}
-	if !stream.waitClosed() {
-		t.Error("stream not closed when request creation failed")
-	}
-}
-
 func TestClientNilURI(t *testing.T) {
 	c := New()
-	ctx := context.Background()
 
-	if _, err := c.Get(ctx, nil); err == nil {
+	if _, err := c.Get(nil); err == nil {
 		t.Error("Get with nil uri: want error")
 	}
 	stream := newReadCloser(strings.NewReader("x"))
-	if _, err := c.UploadByPost(ctx, nil, stream); err == nil {
+	if _, err := c.UploadByPost(nil, stream); err == nil {
 		t.Error("UploadByPost with nil uri: want error")
 	}
 	if !stream.waitClosed() {
 		t.Error("stream not closed when request creation failed")
-	}
-}
-
-func TestClientContextCanceled(t *testing.T) {
-	srv, _ := newTestServer(t)
-	c := New()
-	uri := parseURL(t, srv.URL)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	if _, err := c.Get(ctx, uri); !errors.Is(err, context.Canceled) {
-		t.Errorf("Get err = %v, want context.Canceled", err)
-	}
-	stream := newReadCloser(strings.NewReader("x"))
-	if _, err := c.UploadByPost(ctx, uri, stream); !errors.Is(err, context.Canceled) {
-		t.Errorf("UploadByPost err = %v, want context.Canceled", err)
-	}
-	if !stream.waitClosed() {
-		t.Error("stream not closed")
-	}
-}
-
-func TestClientContextDeadline(t *testing.T) {
-	srv := newBlockingServer(t)
-	c := New()
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-
-	if _, err := c.Get(ctx, parseURL(t, srv.URL)); !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("err = %v, want context.DeadlineExceeded", err)
-	}
-}
-
-func TestClientContextCanceledDuringUpload(t *testing.T) {
-	srv := newBlockingServer(t)
-	c := New()
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// The stream never produces data until pw is closed, so the upload can
-	// only end through ctx.
-	pr, pw := io.Pipe()
-	stream := newReadCloser(pr)
-	time.AfterFunc(50*time.Millisecond, cancel)
-
-	if _, err := c.UploadByPut(ctx, parseURL(t, srv.URL), stream); !errors.Is(err, context.Canceled) {
-		t.Errorf("err = %v, want context.Canceled", err)
-	}
-	// Let the blocked Read return so the upload goroutine can finish.
-	pw.Close()
-	if !stream.waitClosed() {
-		t.Error("stream not closed after cancel")
-	}
-}
-
-func TestClientContextPerRequest(t *testing.T) {
-	// One client is shared by requests with different contexts. Canceling
-	// one request's context must not affect the other.
-	srv, ch := newTestServer(t)
-	c := New()
-	uri := parseURL(t, srv.URL)
-
-	canceled, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := c.Get(canceled, uri); !errors.Is(err, context.Canceled) {
-		t.Errorf("canceled Get err = %v, want context.Canceled", err)
-	}
-
-	res, err := c.Get(context.Background(), uri)
-	if err != nil {
-		t.Fatalf("Get after another request was canceled: %v", err)
-	}
-	<-ch
-	if b := res.Body(); b != "ok:GET" {
-		t.Errorf("body = %q", b)
-	}
-}
-
-func TestClientContextCoversResponseBody(t *testing.T) {
-	// The server sends the headers, then waits before sending the body.
-	release := make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.(http.Flusher).Flush()
-		select {
-		case <-release:
-			w.Write([]byte("late body"))
-		case <-r.Context().Done():
-		}
-	}))
-	t.Cleanup(srv.Close)
-	t.Cleanup(func() { close(release) })
-	c := New()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	res, err := c.Get(ctx, parseURL(t, srv.URL))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Canceling before the body is read aborts the body read.
-	cancel()
-	if err := res.Err(); !errors.Is(err, context.Canceled) {
-		t.Errorf("Err() = %v, want context.Canceled", err)
 	}
 }
 
@@ -350,14 +233,13 @@ func TestClientUpload(t *testing.T) {
 
 	srv, ch := newTestServer(t)
 	c := New()
-	ctx := context.Background()
 	uri := parseURL(t, srv.URL)
 
 	tests := []struct {
 		name      string
 		method    string
 		chunkSize int
-		call      func(context.Context, *url.URL, io.ReadCloser) (*Response, error)
+		call      func(*url.URL, io.ReadCloser) (*Response, error)
 	}{
 		{"UploadByPost", http.MethodPost, 3, c.UploadByPost},
 		{"UploadByPut", http.MethodPut, 4096, c.UploadByPut},
@@ -367,7 +249,7 @@ func TestClientUpload(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c.ChunkSize = tt.chunkSize
 			stream := newReadCloser(bytes.NewReader(data))
-			res, err := tt.call(ctx, uri, stream)
+			res, err := tt.call(uri, stream)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -397,10 +279,9 @@ func TestClientUpload(t *testing.T) {
 func TestClientUploadDoesNotMutateHeader(t *testing.T) {
 	srv, ch := newTestServer(t)
 	c := New()
-	ctx := context.Background()
 	uri := parseURL(t, srv.URL)
 
-	if _, err := c.UploadByPost(ctx, uri, io.NopCloser(strings.NewReader("data"))); err != nil {
+	if _, err := c.UploadByPost(uri, io.NopCloser(strings.NewReader("data"))); err != nil {
 		t.Fatal(err)
 	}
 	<-ch
@@ -408,7 +289,7 @@ func TestClientUploadDoesNotMutateHeader(t *testing.T) {
 		t.Errorf("client Header Content-Type = %q, want empty", ct)
 	}
 
-	if _, err := c.Get(ctx, uri); err != nil {
+	if _, err := c.Get(uri); err != nil {
 		t.Fatal(err)
 	}
 	got := <-ch
@@ -425,14 +306,160 @@ func TestClientUploadStreamError(t *testing.T) {
 	c := New()
 
 	stream := &failingReader{data: []byte("partial"), err: errors.New("disk failure")}
-	if _, err := c.UploadByPost(context.Background(), parseURL(t, srv.URL), stream); err == nil {
+	if _, err := c.UploadByPost(parseURL(t, srv.URL), stream); err == nil {
 		t.Error("want error when stream read fails, got nil")
 	}
 }
 
 func TestClientUploadNilStream(t *testing.T) {
 	c := New()
-	if _, err := c.UploadByPost(context.Background(), parseURL(t, "http://example.com"), nil); err == nil {
+	if _, err := c.UploadByPost(parseURL(t, "http://example.com"), nil); err == nil {
 		t.Error("want error for nil stream")
+	}
+}
+
+// isTimeout reports whether err comes from the client's timeout.
+func isTimeout(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
+func TestClientSetTimeout(t *testing.T) {
+	tests := []struct {
+		name   string
+		second int
+		want   time.Duration
+	}{
+		{"positive", 3, 3 * time.Second},
+		{"zero means no timeout", 0, 0},
+		{"negative restores default", -1, defaultTimeout},
+		{"too large does not overflow", math.MaxInt, time.Duration(math.MaxInt64)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := New()
+			c.SetTimeout(10) // start from a non-default value
+			c.SetTimeout(tt.second)
+			if got := c.Timeout(); got != tt.want {
+				t.Errorf("SetTimeout(%d): Timeout() = %v, want %v", tt.second, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestClientSetTimeoutApplies(t *testing.T) {
+	// End-to-end check through SetTimeout. It takes one second, the shortest
+	// timeout SetTimeout can set; the other tests set c.timeout directly.
+	srv := newBlockingServer(t)
+	c := New()
+	c.SetTimeout(1)
+
+	start := time.Now()
+	if _, err := c.Get(parseURL(t, srv.URL)); !isTimeout(err) {
+		t.Errorf("Get err = %v, want timeout", err)
+	}
+	if d := time.Since(start); d < time.Second || d > 5*time.Second {
+		t.Errorf("Get took %v, want about 1s", d)
+	}
+}
+
+func TestClientTimeout(t *testing.T) {
+	srv := newBlockingServer(t)
+	c := New()
+	c.timeout = 50 * time.Millisecond
+	uri := parseURL(t, srv.URL)
+
+	if _, err := c.Get(uri); !isTimeout(err) {
+		t.Errorf("Get err = %v, want timeout", err)
+	}
+
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	stream := newReadCloser(pr)
+	if _, err := c.UploadByPut(uri, stream); !isTimeout(err) {
+		t.Errorf("UploadByPut err = %v, want timeout", err)
+	}
+	pw.Close()
+	if !stream.waitClosed() {
+		t.Error("stream not closed after timeout")
+	}
+}
+
+func TestClientZeroTimeout(t *testing.T) {
+	// Zero means no timeout, so requests must not fail immediately.
+	srv, ch := newTestServer(t)
+	c := New()
+	c.SetTimeout(0)
+	uri := parseURL(t, srv.URL)
+
+	res, err := c.Get(uri)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	<-ch
+	if b := res.Body(); b != "ok:GET" {
+		t.Errorf("body = %q", b)
+	}
+
+	res, err = c.UploadByPost(uri, io.NopCloser(strings.NewReader("data")))
+	if err != nil {
+		t.Fatalf("UploadByPost: %v", err)
+	}
+	<-ch
+	if b := res.Body(); b != "ok:POST" {
+		t.Errorf("body = %q", b)
+	}
+}
+
+func TestClientTimeoutCoversResponseBody(t *testing.T) {
+	// The server sends the headers, then never sends the body.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	c := New()
+	c.timeout = 100 * time.Millisecond
+
+	res, err := c.Get(parseURL(t, srv.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Err(); !isTimeout(err) {
+		t.Errorf("Err() = %v, want timeout", err)
+	}
+}
+
+func TestClientBodyReadableAfterReturn(t *testing.T) {
+	// The body is read after the request method has returned. It must not be
+	// cut off by anything that ends when the method returns.
+	body := strings.Repeat("a", 1<<20)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	c := New()
+	uri := parseURL(t, srv.URL)
+
+	for i := 0; i < 20; i++ {
+		res, err := c.Get(uri)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := res.Err(); err != nil {
+			t.Fatalf("Get #%d: Err() = %v", i, err)
+		}
+		if n := len(res.Binary()); n != len(body) {
+			t.Fatalf("Get #%d: len = %d, want %d", i, n, len(body))
+		}
+
+		res, err = c.UploadByPost(uri, io.NopCloser(strings.NewReader("x")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := len(res.Binary()); n != len(body) {
+			t.Fatalf("UploadByPost #%d: len = %d, want %d (err %v)", i, n, len(body), res.Err())
+		}
 	}
 }
